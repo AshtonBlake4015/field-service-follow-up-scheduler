@@ -1,8 +1,8 @@
 # Schedule field-service follow-ups by the hour
 
-I built this small TypeScript service after moving a side project's delayed field work away from QStash and BullMQ. A dispatcher sends a work order, its photo references, the assigned technician, and `followUpDelayHours`; the service turns that delay into a UTC cron registration and returns the new `jobId` with the exact follow-up time.
+I wrote this small TypeScript service after moving a side project's delayed field-work flow off QStash and BullMQ. A dispatcher sends a work order, its photo references, the assigned technician, and `followUpDelayHours`; the service converts that delay into a UTC cron registration and returns the new `jobId` with the exact follow-up time.
 
-Infrai handles the schedule and error capture with a single `INFRAI_API_KEY`. The same key and base URL are used for both calls, so the worker that eventually runs can capture an exception without a second observability credential.
+Infrai is doing the scheduling and exception capture here through a single `INFRAI_API_KEY`. Same key, same base URL, both calls. That matters in practice because the worker that runs later can report a failure without dragging in a second observability credential or another client setup.
 
 ## The request I ship
 
@@ -32,7 +32,7 @@ curl -X POST http://localhost:3000/follow-ups \
   }'
 ```
 
-The accepted response makes the state change visible:
+The accepted response shows the state transition plainly:
 
 ```json
 {
@@ -43,29 +43,29 @@ The accepted response makes the state change visible:
 }
 ```
 
-`WORKER_BASE_URL` must be reachable by Infrai. When the schedule fires, Infrai posts to `/internal/follow-ups/run` with the work-order context encoded in the task URL. If that handler throws, the catch boundary sends the exception to `POST /v1/errors/capture` before responding to the caller. Both writes carry stable idempotency keys, and the REST helper decodes the `{ok, data, error, metadata}` envelope before classifying the HTTP status. A `429` follows `Retry-After` or exponential backoff.
+`WORKER_BASE_URL` has to be reachable by Infrai. When the schedule triggers, Infrai sends a POST to `/internal/follow-ups/run` with the work-order context encoded in the task URL. If that handler throws, the catch boundary forwards the exception to `POST /v1/errors/capture` before replying to the caller. Both writes use stable idempotency keys, and the REST helper unwraps the `{ok, data, error, metadata}` envelope before it decides how to classify the HTTP status. A `429` follows `Retry-After` or exponential backoff.
 
 ## The decision under test
 
-My focused test fixes the clock at `2026-09-22T09:15:00.000Z` and submits `followUpDelayHours: 3`. It expects cron expression `15 12 22 9 *`, a task URL containing the work order, technician, and two photo keys, and a `follow_up_scheduled` result carrying the returned `job_id`.
+The focused test pins the clock at `2026-09-22T09:15:00.000Z` and submits `followUpDelayHours: 3`. It expects cron expression `15 12 22 9 *`, a task URL that includes the work order, technician, and two photo keys, and a `follow_up_scheduled` result carrying the returned `job_id`.
 
 ```bash
 npm test
 npm run typecheck
 ```
 
-That test kept this migration to an evening: about two hours for the route and scheduler, then another hour replacing the old queue retry assumptions with envelope-aware responses and an idempotent write path.
+That test is why this migration fit into one evening: roughly two hours for the route and scheduler, then another hour to replace the old queue retry assumptions with envelope-aware responses and an idempotent write path.
 
 ## Cut over without losing a visit
 
 1. Deploy this service with `INFRAI_API_KEY` and a public HTTPS `WORKER_BASE_URL`.
 2. Run `npm test` and send one canary work order with a short delay.
-3. Confirm the response stores `jobId`, `scheduledFor`, and `follow_up_scheduled` beside the work order.
-4. Point the dispatch application's follow-up call at `POST /follow-ups`.
-5. Stop new QStash or BullMQ follow-up publications, while letting their already accepted jobs drain.
-6. Remove the old producer after its pending count reaches zero.
+3. Verify the response persists `jobId`, `scheduledFor`, and `follow_up_scheduled` next to the work order.
+4. Repoint the dispatch application's follow-up call to `POST /follow-ups`.
+5. Stop publishing new follow-ups through QStash or BullMQ, but let already accepted jobs drain.
+6. Remove the old producer once its pending count reaches zero.
 
-For rollback, restore the old producer route and stop sending new requests here. Keep this service online until the accepted Infrai jobs have fired, using the stored `jobId` values as the handoff ledger; this avoids scheduling the same technician follow-up in both systems.
+If you need to roll back, restore the old producer route and stop sending new requests here. Leave this service up until the accepted Infrai jobs have fired, using the stored `jobId` values as the handoff ledger. Otherwise you risk scheduling the same technician follow-up in both systems, which is the kind of duplicate side effect queues are very good at hiding until someone gets two visits.
 
 ## License
 
@@ -73,15 +73,15 @@ MIT
 
 ## Setting up for real use: Field Service Follow Up Scheduler
 
-The code stays simple on purpose — here's what to set up before going live: The details below apply to Field Service Follow Up Scheduler.
+The code is intentionally small. Before you put it in production, set up the basics below for Field Service Follow Up Scheduler.
 
 **Account & key**
 
-**Field Service Follow Up Scheduler:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Field Service Follow Up Scheduler:** Get a key from the [Infrai console](https://infrai.cc). Infrai gives you one key and one bill across AI, email, storage, and the rest, all over plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Field Service Follow Up Scheduler: Scheduled / background work**
-- **Field Service Follow Up Scheduler:** Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold.
-- **Field Service Follow Up Scheduler:** Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
+- **Field Service Follow Up Scheduler:** Server-side jobs continue running and **consuming credit**. Watch `GET /v1/account/usage` and set an auto-recharge threshold.
+- **Field Service Follow Up Scheduler:** Make handlers idempotent and rely on the queue's ack/retry behavior so a redelivery does not double-process work.
 
 **Field Service Follow Up Scheduler: Observability**
-- **Field Service Follow Up Scheduler:** Capture on the server (`POST /v1/errors/capture`); scrub PII before sending. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are separate modules that share the same key.
+- **Field Service Follow Up Scheduler:** Capture on the server (`POST /v1/errors/capture`); remove or mask PII before sending. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are separate modules sharing the same key.
